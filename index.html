@@ -102,6 +102,7 @@
         let initialNodePositions = null; // To store original layout positions
         let nodeDataSet = null; // Vis.js DataSet for nodes
         let edgeDataSet = null; // Vis.js DataSet for edges
+        let hasDeletions = false; // *** ADDED: Flag to track if nodes were deleted ***
 
         // --- Constants ---
         const VisitState = { UNVISITED: 0, VISITING: 1, VISITED: 2 };
@@ -188,6 +189,42 @@
             resetButton.style.display = 'none';
             loader.style.display = 'none';
             selectDirButton.disabled = false;
+        }
+        function handleNodeDeletion(params) {
+            if (params.nodes.length > 0) { // Check if the double click was on a node
+                const nodeId = params.nodes[0];
+                console.log(`Double click on node: ${nodeId}`);
+
+                // Optional: Check if node still exists in dataset (safety)
+                 if (!nodeDataSet || !nodeDataSet.get(nodeId)) {
+                     console.warn(`Node ${nodeId} not found in dataset for deletion.`);
+                     return;
+                 }
+
+
+                if (confirm(`Are you sure you want to delete module "${nodeId}" and its connections?`)) {
+                    try {
+                        nodeDataSet.remove({ id: nodeId }); // Remove node (Vis.js removes connected edges)
+                        console.log(`Node ${nodeId} removed.`);
+                        statusDiv.textContent = `Node "${nodeId}" deleted.`;
+
+                        // Disable reset button after first deletion
+                        if (!hasDeletions) {
+                            hasDeletions = true;
+                            resetButton.disabled = true; // Disable reset button
+                            resetButton.title = "Reset disabled after node deletion"; // Add tooltip
+                            console.log("Reset button disabled due to node deletion.");
+                        }
+                        // Optional: Update node/edge count in status? Might be overkill.
+
+                    } catch (e) {
+                        console.error(`Error removing node ${nodeId}:`, e);
+                        statusDiv.textContent = `Error deleting node "${nodeId}".`;
+                    }
+                } else {
+                    console.log(`Deletion of node ${nodeId} cancelled.`);
+                }
+            }
         }
 
         function finalizeProcessing(success = true) {
@@ -290,10 +327,10 @@
 
 
                 // --- Rendering (Conditional Layout - Hierarchical Flipped) ---
-        function renderGraph(nodesData, edgesData, hasCycles) { // Accept hasCycles flag
+       function renderGraph(nodesData, edgesData, hasCycles) {
             const container = graphDiv;
-            const data = { nodes: nodesData, edges: edgesData };
-            let options; // Declare options variable
+            const data = { nodes: nodesData, edges: edgesData }; // Use the DataSets passed in
+            let options;
 
             const commonNodeStyles = { /* ... Same as before ... */
                 shape: 'box', margin: 20, font: { size: 18, color: '#333' }, borderWidth: 1,
@@ -306,40 +343,26 @@
             const commonInteraction = { dragNodes: true, dragView: true, zoomView: true, hover: true, tooltipDelay: 200 };
 
             if (hasCycles) {
-                // --- OPTIONS for Physics Layout (Cycles Present) --- (Unchanged)
+                // Physics Layout Options (Unchanged)
                 console.log("Using Physics-based layout (Cycles detected)");
                 statusDiv.textContent = "Cycles detected. Calculating physics-based layout...";
-                options = {
+                options = { /* ... Same Physics options as before ... */
                     layout: { hierarchical: { enabled: false } },
-                    physics: {
-                        enabled: true, barnesHut: { gravitationalConstant: -15000, springLength: 250, springConstant: 0.05, damping: 0.3, centralGravity: 0.4, avoidOverlap: 0.6 },
-                        minVelocity: 0.75, solver: 'barnesHut', stabilization: { iterations: 1500 }
-                    },
-                    nodes: commonNodeStyles, edges: commonEdgeStyles, interaction: commonInteraction,
-                    height: '100%', width: '100%'
+                    physics: { enabled: true, barnesHut: { gravitationalConstant: -15000, springLength: 250, springConstant: 0.05, damping: 0.3, centralGravity: 0.4, avoidOverlap: 0.6 }, minVelocity: 0.75, solver: 'barnesHut', stabilization: { iterations: 1500 } },
+                    nodes: commonNodeStyles, edges: commonEdgeStyles, interaction: commonInteraction, height: '100%', width: '100%'
                 };
             } else {
-                // --- OPTIONS for Hierarchical Layout (No Cycles - Flipped) ---
+                // Hierarchical Layout Options (Unchanged - DU direction)
                 console.log("Using Hierarchical layout (No cycles detected)");
                 statusDiv.textContent = "Calculating hierarchical layout...";
-                options = {
-                    layout: {
-                        hierarchical: {
-                            enabled: true,
-                            direction: 'DU',        // *** CHANGED from 'UD' to 'DU' ***
-                            sortMethod: 'directed',
-                            levelSeparation: 140,
-                            nodeSpacing: 200,
-                            treeSpacing: 250
-                        }
-                    },
+                options = { /* ... Same Hierarchical options as before (DU direction) ... */
+                    layout: { hierarchical: { enabled: true, direction: 'DU', sortMethod: 'directed', levelSeparation: 140, nodeSpacing: 200, treeSpacing: 250 } },
                     physics: { enabled: false },
-                    nodes: commonNodeStyles, edges: commonEdgeStyles, interaction: commonInteraction,
-                    height: '100%', width: '100%'
+                    nodes: commonNodeStyles, edges: commonEdgeStyles, interaction: commonInteraction, height: '100%', width: '100%'
                 };
             }
 
-            // --- Render Graph --- (Unchanged logic below)
+            // --- Render Graph ---
             if (network) network.destroy();
             console.log("Initializing Vis.js Network...");
 
@@ -348,35 +371,26 @@
                 console.log("Vis.js Network object created successfully.");
                 loader.style.display = 'none';
 
+                // *** ADD EVENT LISTENER FOR DELETION ***
+                network.on("doubleClick", handleNodeDeletion);
+                console.log("Attached doubleClick listener for node deletion.");
+
+
+                // --- Post-Layout Handling (Unchanged logic) ---
                 if (hasCycles) {
-                    // Physics Post-Layout (Unchanged)
-                    network.on("stabilizationIterationsDone", () => {
-                        console.log("Physics stabilization finished.");
-                        try {
-                             network.setOptions({ physics: { enabled: false } });
-                             initialNodePositions = network.getPositions();
-                             console.log("Initial node positions stored (Physics).");
-                             statusDiv.textContent = `Graph rendered (${nodesData.length} modules, ${edgesData.length} dependencies). Ready (Physics Layout).`;
-                             finalizeProcessing(true);
-                        } catch (e) { console.error("Error in physics stabilization callback:", e); finalizeProcessing(false);}
+                    // Physics Post-Layout
+                    network.on("stabilizationIterationsDone", () => { /* ... Same as before ... */
+                        console.log("Physics stabilization finished."); try { network.setOptions({ physics: { enabled: false } }); initialNodePositions = network.getPositions(); console.log("Initial positions stored (Physics)."); statusDiv.textContent = `Graph rendered (${nodesData.length} modules, ${edgesData.length} dependencies). Ready (Physics Layout).`; finalizeProcessing(true); } catch (e) { console.error("Error in physics stabilization callback:", e); finalizeProcessing(false); }
                     });
                 } else {
-                    // Hierarchical Post-Layout (Unchanged logic, uses new options)
+                    // Hierarchical Post-Layout
                     console.log(`Waiting ${LAYOUT_TIMEOUT_MS}ms for initial hierarchical layout...`);
-                    setTimeout(() => {
-                        if (!network) { console.warn("Network destroyed before layout finalization timeout."); return; }
-                        console.log("Finalizing hierarchical layout and enabling free movement.");
-                        try {
-                            initialNodePositions = network.getPositions();
-                            console.log("Initial node positions stored (Hierarchical).");
-                            network.setOptions({ layout: { hierarchical: { enabled: false } } });
-                            console.log("Hierarchical layout disabled for free node movement.");
-                            statusDiv.textContent = `Graph rendered (${nodesData.length} modules, ${edgesData.length} dependencies). Ready (Hierarchical Layout).`;
-                            finalizeProcessing(true);
-                        } catch (e) { console.error("Error during post-layout (setTimeout):", e); finalizeProcessing(false); }
+                    setTimeout(() => { /* ... Same as before ... */
+                        if (!network) { console.warn("Network destroyed before timeout."); return; } console.log("Finalizing hierarchical layout."); try { initialNodePositions = network.getPositions(); console.log("Initial positions stored (Hierarchical)."); network.setOptions({ layout: { hierarchical: { enabled: false } } }); console.log("Hierarchical disabled."); statusDiv.textContent = `Graph rendered (${nodesData.length} modules, ${edgesData.length} dependencies). Ready (Hierarchical Layout).`; finalizeProcessing(true); } catch (e) { console.error("Error during post-layout (setTimeout):", e); finalizeProcessing(false); }
                     }, LAYOUT_TIMEOUT_MS);
                 }
                 network.on('error', (err) => { handleError(err, "Vis.js Network interaction/rendering"); });
+
             } catch (renderError) {
                 handleError(renderError, "graph rendering initialization");
             }
