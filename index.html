@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>C++ Module Dependency Graph (.ixx) - Picker</title>
+    <!-- Load Vis.js library -->
+    <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+    <style>
+        body {
+            font-family: sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            padding: 10px;
+            box-sizing: border-box;
+            background-color: #f4f4f4;
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+        }
+        #controls {
+            margin: 20px;
+            text-align: center;
+        }
+        button {
+            padding: 10px 20px;
+            font-size: 16px;
+            cursor: pointer;
+        }
+        #graph-container {
+            width: 95%;
+            flex-grow: 1; /* Takes remaining height */
+            border: 1px solid #ccc;
+            margin-top: 15px;
+            background-color: #fff;
+            position: relative; /* Needed for status message */
+            min-height: 300px; /* Ensure it's visible */
+        }
+         #graph {
+            width: 100%;
+            height: 100%;
+         }
+        #status {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background-color: rgba(255, 255, 255, 0.85);
+            padding: 5px 8px;
+            border-radius: 3px;
+            color: #333;
+            font-size: 0.9em;
+            z-index: 10; /* Ensure it's above the graph */
+        }
+        .vis-network {
+            outline: none;
+        }
+         /* Simple loading spinner */
+        .loader {
+            border: 4px solid #f3f3f3; /* Light grey */
+            border-top: 4px solid #3498db; /* Blue */
+            border-radius: 50%;
+            width: 30px;
+            height: 30px;
+            animation: spin 1s linear infinite;
+            margin: 10px auto; /* Center it */
+            display: none; /* Hidden by default */
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <h1>C++ Module Dependency Visualizer (.ixx files)</h1>
+
+    <div id="controls">
+        <button id="select-dir-btn">Select Project Directory</button>
+        <button id="reset-layout-btn" style="display: none;">Reset Layout</button> <!-- Initially hidden -->
+        <div id="loader" class="loader"></div>
+    </div>
+    <div id="graph-container">
+        <div id="status">Select a directory to begin analysis.</div>
+        <div id="graph"></div>
+    </div>
+
+       <script>
+        // --- DOM Elements ---
+        const selectDirButton = document.getElementById('select-dir-btn');
+        const resetButton = document.getElementById('reset-layout-btn');
+        const graphContainer = document.getElementById('graph-container');
+        const graphDiv = document.getElementById('graph');
+        const statusDiv = document.getElementById('status');
+        const loader = document.getElementById('loader');
+
+        // --- Global State ---
+        let network = null; // Vis.js network instance
+        let initialNodePositions = null; // To store original layout positions
+        let nodeDataSet = null; // Vis.js DataSet for nodes
+        let edgeDataSet = null; // Vis.js DataSet for edges
+
+        // --- Constants ---
+        const VisitState = { UNVISITED: 0, VISITING: 1, VISITED: 2 };
+        const LAYOUT_TIMEOUT_MS = 350; // Delay for hierarchical layout post-processing
+
+        // --- Initialization ---
+        if (!('showDirectoryPicker' in window)) {
+            statusDiv.textContent = 'Error: Your browser does not support the File System Access API needed for directory selection.';
+            selectDirButton.disabled = true;
+        } else {
+            selectDirButton.addEventListener('click', handleDirectorySelection);
+            resetButton.addEventListener('click', handleResetLayout);
+        }
+
+        // --- Event Handlers ---
+        async function handleDirectorySelection() {
+            resetGraphState();
+            loader.style.display = 'block';
+            selectDirButton.disabled = true;
+
+            try {
+                const dirHandle = await window.showDirectoryPicker();
+                statusDiv.textContent = `Processing directory: ${dirHandle.name}...`;
+                console.log(`Selected directory handle:`, dirHandle);
+                const ixxFiles = [];
+                await processDirectoryHandle(dirHandle, ixxFiles, dirHandle.name);
+                console.log(`Found ${ixxFiles.length} .ixx files.`);
+                if (ixxFiles.length > 0) {
+                    analyzeFiles(ixxFiles);
+                } else {
+                    statusDiv.textContent = 'No .ixx files found in the selected directory or its subdirectories.';
+                    finalizeProcessing(false);
+                }
+            } catch (error) {
+                handleError(error, "directory selection or processing");
+            }
+        }
+
+        function handleResetLayout() {
+            if (network && initialNodePositions) {
+                console.log("Resetting node positions...");
+                statusDiv.textContent = "Resetting node positions...";
+                network.stopSimulation(); // Stop physics if running
+
+                const nodeIds = Object.keys(initialNodePositions);
+                const updates = [];
+                nodeIds.forEach(nodeId => {
+                    const pos = initialNodePositions[nodeId];
+                    if (pos) {
+                        // Use DataSet update for potentially better performance on many nodes
+                        updates.push({ id: nodeId, x: pos.x, y: pos.y });
+                        // network.moveNode(nodeId, pos.x, pos.y); // Alternative
+                    }
+                });
+                 if (nodeDataSet && updates.length > 0) {
+                    nodeDataSet.update(updates);
+                 }
+
+                network.fit({ animation: { duration: 500, easingFunction: 'easeInOutQuad' } });
+
+                // Re-enable free movement settings if they were changed
+                network.setOptions({
+                    layout: { hierarchical: { enabled: false } },
+                    physics: { enabled: false } // Keep physics off after reset
+                });
+
+                statusDiv.textContent = `Graph rendered (${nodeDataSet ? nodeDataSet.length : 0} modules, ${edgeDataSet ? edgeDataSet.length : 0} dependencies). Layout reset.`;
+            } else {
+                console.warn("Cannot reset layout: No network or initial positions stored.");
+            }
+        }
+
+        // --- Utility Functions ---
+        function resetGraphState() {
+            statusDiv.textContent = 'Select a directory to begin analysis.';
+            graphDiv.innerHTML = '';
+            if (network) {
+                network.destroy();
+                network = null;
+            }
+            initialNodePositions = null;
+            nodeDataSet = null;
+            edgeDataSet = null;
+            resetButton.style.display = 'none';
+            loader.style.display = 'none';
+            selectDirButton.disabled = false;
+        }
+
+        function finalizeProcessing(success = true) {
+            loader.style.display = 'none';
+            selectDirButton.disabled = false;
+            if (success && network) {
+                 resetButton.style.display = 'inline-block'; // Show reset only on success
+            } else {
+                 resetButton.style.display = 'none';
+            }
+        }
+
+        function handleError(error, context) {
+             if (error.name === 'AbortError') {
+                statusDiv.textContent = 'Operation cancelled.';
+                console.log(`${context} cancelled by user.`);
+            } else {
+                statusDiv.textContent = `Error during ${context}: ${error.message}`;
+                console.error(`Error during ${context}:`, error);
+            }
+            finalizeProcessing(false);
+        }
+
+        // --- File System Processing (Unchanged) ---
+        async function processDirectoryHandle(dirHandle, ixxFiles, currentPath = '') { /* ... Same as before ... */
+             try {
+                for await (const entry of dirHandle.values()) {
+                    const entryPath = currentPath ? `${currentPath}/${entry.name}` : entry.name;
+                    if (entry.kind === 'directory') {
+                        await processDirectoryHandle(entry, ixxFiles, entryPath);
+                    } else if (entry.kind === 'file' && entry.name.endsWith('.ixx')) {
+                        try {
+                            const fileContent = await readFileContentFromHandle(entry);
+                            if (fileContent !== null) ixxFiles.push({ name: entryPath, content: fileContent });
+                        } catch (fileError) { console.error(`Failed to read file: ${entryPath}`, fileError); }
+                    }
+                }
+            } catch (dirError) { console.error(`Error reading dir: ${currentPath || dirHandle.name}`, dirError); }
+        }
+        async function readFileContentFromHandle(fileHandle) { /* ... Same as before ... */
+            try { const file = await fileHandle.getFile(); return await file.text(); }
+            catch (error) { console.error(`Error getting file content: ${fileHandle.name}`, error); return null; }
+        }
+
+        // --- Cycle Detection (Unchanged) ---
+        function detectCycles(allNodes, dependencies) { /* ... Same as before ... */
+            const adj = new Map(); allNodes.forEach(node => adj.set(node, new Set()));
+            for (const fromNode in dependencies) { if (adj.has(fromNode)) { dependencies[fromNode].forEach(toNode => { if (adj.has(toNode)) adj.get(fromNode).add(toNode); }); } }
+            const visitState = new Map(); allNodes.forEach(node => visitState.set(node, VisitState.UNVISITED));
+            const recursionStack = new Map(); allNodes.forEach(node => recursionStack.set(node, false));
+            const nodesInCycle = new Set(); const edgesInCycle = new Set();
+            function dfs(node) {
+                visitState.set(node, VisitState.VISITING); recursionStack.set(node, true);
+                const neighbors = adj.get(node) || new Set();
+                for (const neighbor of neighbors) {
+                    const edgeId = `${node}->${neighbor}`;
+                    if (recursionStack.get(neighbor)) { nodesInCycle.add(node); nodesInCycle.add(neighbor); edgesInCycle.add(edgeId); for(const [sn, iS] of recursionStack.entries()) if(iS) nodesInCycle.add(sn); }
+                    else if (visitState.get(neighbor) === VisitState.UNVISITED) { if (dfs(neighbor)) { if(nodesInCycle.has(node) && nodesInCycle.has(neighbor)) edgesInCycle.add(edgeId); } }
+                    if (nodesInCycle.has(node) && nodesInCycle.has(neighbor)) edgesInCycle.add(edgeId);
+                }
+                recursionStack.set(node, false); visitState.set(node, VisitState.VISITED); return nodesInCycle.has(node);
+            }
+            for (const node of allNodes) { if (visitState.get(node) === VisitState.UNVISITED) dfs(node); }
+            console.log("Nodes in cycle:", nodesInCycle); console.log("Edges in cycle:", edgesInCycle); return { nodesInCycle, edgesInCycle };
+        }
+
+        // --- Analysis (Passes hasCycles flag) ---
+        function analyzeFiles(files) {
+            statusDiv.textContent = `Analyzing ${files.length} files...`; console.log("Starting analysis...");
+            const moduleDeclareRegex = /^\s*export\s+module\s+([a-zA-Z0-9_.]+)\s*;/m; const importRegex = /^\s*(?:export\s+)?import\s+([a-zA-Z0-9_.]+)\s*;/gm;
+            const dependencies = {}; const allModules = new Set();
+
+            setTimeout(() => { // Allow UI update
+                try {
+                    files.forEach(file => { /* ... Parsing logic same as before ... */
+                        const content = file.content; let declaredModule = null; const moduleMatch = content.match(moduleDeclareRegex);
+                        if (moduleMatch && moduleMatch[1]) { declaredModule = moduleMatch[1]; allModules.add(declaredModule); if (!dependencies[declaredModule]) dependencies[declaredModule] = new Set(); } else return;
+                        let importMatch; importRegex.lastIndex = 0; while ((importMatch = importRegex.exec(content)) !== null) { allModules.add(importMatch[1]); if (declaredModule) dependencies[declaredModule].add(importMatch[1]); }
+                    });
+                    if (allModules.size === 0) { statusDiv.textContent = 'Analysis complete. No modules found.'; finalizeProcessing(false); return; }
+
+                    console.log("Detecting cycles..."); const { nodesInCycle, edgesInCycle } = detectCycles(allModules, dependencies);
+                    const hasCycles = nodesInCycle.size > 0; // *** Determine if cycles exist ***
+                    console.log(`Cycle detection complete. Has Cycles: ${hasCycles}`);
+
+                    nodeDataSet = new vis.DataSet(Array.from(allModules).map(modName => { /* ... Node creation with cycle coloring same as before ... */
+                         const nodeData = { id: modName, label: modName }; if (nodesInCycle.has(modName)) { nodeData.color = { border: '#E74C3C', background: '#F5B7B1', highlight: { border: '#C0392B', background: '#FADBD8' }, hover: { border: '#C0392B', background: '#FADBD8' } }; nodeData.font = { color: '#A93226' }; } return nodeData;
+                    }));
+                    const edges = []; for (const declModule in dependencies) { dependencies[declModule].forEach(importedModule => { /* ... Edge creation with cycle coloring same as before ... */
+                        if (allModules.has(declModule) && allModules.has(importedModule)) { const edgeId = `${declModule}->${importedModule}`; const edgeData = { from: declModule, to: importedModule, arrows: 'to' }; if (edgesInCycle.has(edgeId)) { edgeData.color = { color:'#E74C3C', highlight:'#C0392B', hover:'#C0392B', inherit: false, opacity: 1.0 }; edgeData.width = 2; } edges.push(edgeData); }
+                    }); }
+                    edgeDataSet = new vis.DataSet(edges);
+
+                    console.log("Vis.js Nodes:", nodeDataSet.length); console.log("Vis.js Edges:", edgeDataSet.length);
+                    renderGraph(nodeDataSet, edgeDataSet, hasCycles); // *** Pass hasCycles flag ***
+
+                } catch (analysisError) { handleError(analysisError, "analysis"); }
+            }, 10);
+        }
+
+
+                // --- Rendering (Conditional Layout - Hierarchical Flipped) ---
+        function renderGraph(nodesData, edgesData, hasCycles) { // Accept hasCycles flag
+            const container = graphDiv;
+            const data = { nodes: nodesData, edges: edgesData };
+            let options; // Declare options variable
+
+            const commonNodeStyles = { /* ... Same as before ... */
+                shape: 'box', margin: 20, font: { size: 18, color: '#333' }, borderWidth: 1,
+                color: { border: '#cccccc', background: '#e0e0ff', highlight: { border: '#2B7CE9', background: '#D2E5FF' }, hover: { border: '#8888ff', background: '#f0f0ff' } },
+            };
+            const commonEdgeStyles = { /* ... Same as before ... */
+                 width: 1, color: { color:'#848484', highlight:'#5555dd', hover: '#7777cc', inherit: 'from', opacity: 1.0 },
+                 arrows: { to: { enabled: true, scaleFactor: 0.7 } }, smooth: { enabled: true, type: "cubicBezier", roundness: 0.4 }
+            };
+            const commonInteraction = { dragNodes: true, dragView: true, zoomView: true, hover: true, tooltipDelay: 200 };
+
+            if (hasCycles) {
+                // --- OPTIONS for Physics Layout (Cycles Present) --- (Unchanged)
+                console.log("Using Physics-based layout (Cycles detected)");
+                statusDiv.textContent = "Cycles detected. Calculating physics-based layout...";
+                options = {
+                    layout: { hierarchical: { enabled: false } },
+                    physics: {
+                        enabled: true, barnesHut: { gravitationalConstant: -15000, springLength: 250, springConstant: 0.05, damping: 0.3, centralGravity: 0.4, avoidOverlap: 0.6 },
+                        minVelocity: 0.75, solver: 'barnesHut', stabilization: { iterations: 1500 }
+                    },
+                    nodes: commonNodeStyles, edges: commonEdgeStyles, interaction: commonInteraction,
+                    height: '100%', width: '100%'
+                };
+            } else {
+                // --- OPTIONS for Hierarchical Layout (No Cycles - Flipped) ---
+                console.log("Using Hierarchical layout (No cycles detected)");
+                statusDiv.textContent = "Calculating hierarchical layout...";
+                options = {
+                    layout: {
+                        hierarchical: {
+                            enabled: true,
+                            direction: 'DU',        // *** CHANGED from 'UD' to 'DU' ***
+                            sortMethod: 'directed',
+                            levelSeparation: 140,
+                            nodeSpacing: 200,
+                            treeSpacing: 250
+                        }
+                    },
+                    physics: { enabled: false },
+                    nodes: commonNodeStyles, edges: commonEdgeStyles, interaction: commonInteraction,
+                    height: '100%', width: '100%'
+                };
+            }
+
+            // --- Render Graph --- (Unchanged logic below)
+            if (network) network.destroy();
+            console.log("Initializing Vis.js Network...");
+
+            try {
+                network = new vis.Network(container, data, options);
+                console.log("Vis.js Network object created successfully.");
+                loader.style.display = 'none';
+
+                if (hasCycles) {
+                    // Physics Post-Layout (Unchanged)
+                    network.on("stabilizationIterationsDone", () => {
+                        console.log("Physics stabilization finished.");
+                        try {
+                             network.setOptions({ physics: { enabled: false } });
+                             initialNodePositions = network.getPositions();
+                             console.log("Initial node positions stored (Physics).");
+                             statusDiv.textContent = `Graph rendered (${nodesData.length} modules, ${edgesData.length} dependencies). Ready (Physics Layout).`;
+                             finalizeProcessing(true);
+                        } catch (e) { console.error("Error in physics stabilization callback:", e); finalizeProcessing(false);}
+                    });
+                } else {
+                    // Hierarchical Post-Layout (Unchanged logic, uses new options)
+                    console.log(`Waiting ${LAYOUT_TIMEOUT_MS}ms for initial hierarchical layout...`);
+                    setTimeout(() => {
+                        if (!network) { console.warn("Network destroyed before layout finalization timeout."); return; }
+                        console.log("Finalizing hierarchical layout and enabling free movement.");
+                        try {
+                            initialNodePositions = network.getPositions();
+                            console.log("Initial node positions stored (Hierarchical).");
+                            network.setOptions({ layout: { hierarchical: { enabled: false } } });
+                            console.log("Hierarchical layout disabled for free node movement.");
+                            statusDiv.textContent = `Graph rendered (${nodesData.length} modules, ${edgesData.length} dependencies). Ready (Hierarchical Layout).`;
+                            finalizeProcessing(true);
+                        } catch (e) { console.error("Error during post-layout (setTimeout):", e); finalizeProcessing(false); }
+                    }, LAYOUT_TIMEOUT_MS);
+                }
+                network.on('error', (err) => { handleError(err, "Vis.js Network interaction/rendering"); });
+            } catch (renderError) {
+                handleError(renderError, "graph rendering initialization");
+            }
+        }
+
+    </script>
+</body>
+</html>
